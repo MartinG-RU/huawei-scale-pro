@@ -9,15 +9,15 @@ It is a port of the Huawei driver in [openScale](https://github.com/oliexdev/ope
 which requested Scale 3 support), reworked around Home Assistant's Bluetooth
 stack so it works with local adapters **and** ESPHome Bluetooth proxies.
 
-> **Status: unverified on real hardware.** The author of this port did not have
-> a Scale 3. What *has* been checked: the framing, CRCs, key derivation, AES
-> encryption and measurement decoding reproduce, byte for byte, a real capture
-> from a Scale 3 taken from openScale's own test suite; the body-composition model
-> reproduces openScale's reference vectors; and the full connect → authenticate →
-> sync → measure → history flow runs against a *simulated* scale
-> (`tests/fake_scale.py`). A simulation built from the same understanding cannot
-> catch firmware behaviour nobody has documented, so please report what you
-> see (the **Status** sensor and debug log below make that easy).
+> **Status: works on one real scale.** Confirmed end to end on a Scale 3 (firmware
+> 2.0.0.70, model `M0CJ9`) through an ESPHome Bluetooth proxy: connect,
+> authenticate, sync the profile and publish a weigh-in. Beyond that, the framing,
+> CRCs, key derivation, AES encryption and measurement decoding reproduce, byte for
+> byte, a real capture from openScale's own test suite; the body-composition model
+> reproduces openScale's reference vectors; and the full flow, including history,
+> runs against a *simulated* scale (`tests/fake_scale.py`). History import, other
+> firmware versions and local (non-proxy) adapters are untested, so please report
+> what you see (the **Status** sensor and debug log below make that easy).
 
 ## What you get
 
@@ -73,7 +73,7 @@ You do not have to enter anything: the three values are built in
 session keys from them and the scale's address automatically. They are the
 constants the Huawei Health app itself uses (its native library calls them
 CAK, A and B; here A and B are C1 and C2), recovered by static analysis of that
-library. They have not been checked against a live scale.
+library. They authenticate against a real Scale 3 (confirmed on firmware 2.0.0.70).
 
 If your scale rejects them, Home Assistant starts a re-authentication flow
 after three failures. There you can paste a custom key (96 hex characters: CAK,

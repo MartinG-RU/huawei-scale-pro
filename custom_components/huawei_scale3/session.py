@@ -396,7 +396,9 @@ class Scale3Session:
             try:
                 ack = await self._expect("set_user_info", USER_INFO_ACK_TIMEOUT)
                 if ack[:1] != b"\x00":
-                    _LOGGER.warning("Scale returned status %s for user profile", ack[:1].hex())
+                    # A real Scale 3 (fw 2.0.0.70) answers 01 here and still measures
+                    # normally, as in openScale, so this is not an error.
+                    _LOGGER.debug("Scale returned status %s for user profile", ack[:1].hex())
             except TimeoutError:
                 _LOGGER.debug("Set-user-info ack timed out; continuing")
 

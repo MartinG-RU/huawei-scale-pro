@@ -1,1 +1,12 @@
 pytest-homeassistant-custom-component
+# Home Assistant's bluetooth and usb integrations are imported by the
+# integration; their own requirements are not pulled in by the test plugin.
+aiousbwatcher
+pyserial
+bleak
+bleak-retry-connector
+bluetooth-adapters
+bluetooth-auto-recovery
+bluetooth-data-tools
+dbus-fast
+habluetooth

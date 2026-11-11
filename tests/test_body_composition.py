@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from custom_components.huawei_scale3.body_composition import calculate
+from custom_components.huawei_scale_pro.body_composition import calculate
 
 
 def _check(h, w, age, male, z, fat, water, smm_kg, bone, bmr, visceral):

@@ -7,16 +7,16 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 
 from .const import DOMAIN
-from .coordinator import HuaweiScale3Coordinator
+from .coordinator import HuaweiScaleProCoordinator
 
 
-class HuaweiScale3Entity(Entity):
+class HuaweiScaleProEntity(Entity):
     """An entity that refreshes whenever the coordinator publishes."""
 
     _attr_has_entity_name = True
     _attr_should_poll = False
 
-    def __init__(self, coordinator: HuaweiScale3Coordinator, key: str) -> None:
+    def __init__(self, coordinator: HuaweiScaleProCoordinator, key: str) -> None:
         self.coordinator = coordinator
         self._attr_translation_key = key
         self._attr_unique_id = f"{coordinator.address}_{key}"
@@ -25,7 +25,7 @@ class HuaweiScale3Entity(Entity):
             connections={(dr.CONNECTION_BLUETOOTH, coordinator.address)},
             name=coordinator.entry.title,
             manufacturer="Huawei",
-            model="Scale 3",
+            model=coordinator.model.display_name,
             sw_version=coordinator.sw_version,
         )
 

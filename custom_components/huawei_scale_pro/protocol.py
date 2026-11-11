@@ -1,9 +1,27 @@
-"""Huawei Scale 3 ("Hagrid" / WSP) wire protocol.
+"""Huawei "Hagrid" / WSP wire protocol (Scale 3, Scale 3 Pro, Scale 2 Pro, Honor).
 
 Pure Python, no Home Assistant imports, so it can be unit-tested on its own.
 
-This is a port of the protocol handling in the openScale project
-(``HuaweiHagridWspLib.kt``, GPL-3.0, https://github.com/oliexdev/openScale).
+The protocol handling is a port of the openScale project
+(``HuaweiHagridWspLib.kt`` / ``HuaweiHagridWspHandler.kt``, GPL-3.0,
+https://github.com/oliexdev/openScale), extended for the Scale 3 Pro:
+
+* the product-marker → model table is ported from openScale's
+  ``productProfileForMarker()``, so a Scale 3 Pro is recognised as such (its
+  advertisement contains ``HUAWEI SCALE 3 PRO``, which also contains the Scale 3
+  marker — longest match wins here);
+* the per-model user-profile gender encoding is respected (only the plain
+  Scale 3 uses ``male = 1``; every other Hagrid family uses ``male = 0``,
+  ``female = 1``);
+* measurement payloads may be longer than the Scale 3's 26/38 bytes on other
+  families, so parsing can run in a length-tolerant mode and keeps the tail of
+  the packet as hex for diagnostics;
+* the dual-frequency Scale 3 Pro packet carries both a low- and a
+  high-frequency impedance block, which are decoded and exposed separately;
+* the Bluetooth SIG standard characteristics (``0x2A9D`` Weight Measurement,
+  ``0x2A9C`` Body Composition Measurement) are decoded too, as a fallback for
+  firmwares that answer on those instead of the vendor characteristics.
+
 The CAK / C1 / C2 secrets are passed in by the caller (see ``const.py`` for the
 built-in defaults); nothing in this module extracts them from anywhere.
 
@@ -28,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -48,6 +67,16 @@ SVC_CURRENT_TIME = uuid16(0x1805)
 SVC_BODY_COMPOSITION = uuid16(0x181B)
 SVC_WEIGHT_SCALE = uuid16(0x181D)
 
+#: The four vendor services the Hagrid family spreads its protocol over. Used
+#: both for the "subscribe to everything interesting" probe mode and to decide
+#: whether a connected device really speaks this protocol.
+HAGRID_SERVICES: tuple[str, ...] = (
+    SVC_USER_DATA,
+    SVC_CURRENT_TIME,
+    SVC_BODY_COMPOSITION,
+    SVC_WEIGHT_SCALE,
+)
+
 CHR_REQUEST_AUTH = "02b2a08e-f8b0-4047-b1fd-f4e0efeee679"
 CHR_AUTH_TOKEN = "32330a04-15d9-421a-91c5-2a2d5c7525c9"
 CHR_SEND_WORK_KEY = "a3d330f8-b84f-4f48-a78c-f8d1e33b597a"
@@ -67,12 +96,11 @@ CHR_REALTIME_WEIGHT = "46797c17-d639-488d-9476-4789e8472878"
 CHR_HISTORY_WEIGHT = "0212f42a-5f19-4bc1-ba52-d7ec7ccb71a4"
 
 #: Standard-looking User Data Service characteristics (service 181c) that the
-#: app also writes individually, alongside the encrypted SET_USER_INFO blob
-#: we already send. Declared for completeness; not written. The app's own
-#: payload encoding for these three isn't known (only the UUIDs are), while
-#: SET_USER_INFO's 69-byte layout has been validated byte-for-byte against a
-#: real capture (see protocol docstring / tests), so it already covers the
-#: same profile data with a format we can trust.
+#: app also writes individually, alongside the encrypted SET_USER_INFO blob we
+#: send. Declared for completeness; not written. The app's own payload encoding
+#: for these three isn't known (only the UUIDs are), while SET_USER_INFO's
+#: 69-byte layout is the format that has been validated against a real capture,
+#: so it already covers the same profile data.
 CHR_SET_AGE = uuid16(0x2A80)
 CHR_SET_GENDER = uuid16(0x2A8C)
 CHR_SET_HEIGHT = uuid16(0x2A8E)
@@ -92,11 +120,15 @@ NOTIFY_CHARACTERISTICS: tuple[tuple[str, str, str], ...] = (
     (SVC_CURRENT_TIME, CHR_GET_WEIGHT_UNIT, "weight_unit"),
     (SVC_CURRENT_TIME, CHR_STATUS_POLL, "status"),
     (SVC_CURRENT_TIME, CHR_STATUS_RESULT, "status"),
-    (SVC_BODY_COMPOSITION, CHR_BODY_COMPOSITION_MEASUREMENT, "realtime"),
-    (SVC_WEIGHT_SCALE, CHR_WEIGHT_MEASUREMENT, "realtime"),
+    (SVC_BODY_COMPOSITION, CHR_BODY_COMPOSITION_MEASUREMENT, "standard_body"),
+    (SVC_WEIGHT_SCALE, CHR_WEIGHT_MEASUREMENT, "standard_weight"),
     (SVC_BODY_COMPOSITION, CHR_REALTIME_WEIGHT, "realtime"),
     (SVC_BODY_COMPOSITION, CHR_HISTORY_WEIGHT, "history"),
 )
+
+#: Characteristics that carry a *complete* measurement (as opposed to live
+#: progress). The Standard ones use the Bluetooth SIG payload layout.
+STANDARD_KINDS = frozenset({"standard_weight", "standard_body"})
 
 # --------------------------------------------------------------------------
 # Framing
@@ -109,8 +141,7 @@ FRAME_NOTIFY_ENCRYPTED = 0xCD
 
 #: The app's own ceiling for a plain chunk before BLE-frame splitting is 238
 #: bytes (222 for an encrypted one, which needs room for the 16-byte IV); we
-#: never send more than 69 bytes (SET_USER_INFO) so this is never reached
-#: either way.
+#: never send more than 69 bytes (SET_USER_INFO) so this is never reached.
 MAX_SIMPLE_PAYLOAD_BYTES = 238
 SIMPLE_CHUNK_BYTES = 15
 USER_INFO_PAYLOAD_BYTES = 69
@@ -411,7 +442,37 @@ def current_time_payload(now: datetime) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Incoming payloads
+# Impedance
+# --------------------------------------------------------------------------
+
+#: A whole-body BIA impedance is roughly 200–900 ohm. The Scale 3 sends it in
+#: 0.1-ohm units (a real 350 ohm arrives as 3500); openScale's generic
+#: heuristic ("below 4000 is already ohm") misreads that, which is why its Scale
+#: 3 branch divides explicitly. Other families are unmeasured, so the default is
+#: a heuristic that also copes with a firmware that reports plain ohm:
+#: < 1000 → ohm, 1000..39999 → 0.1-ohm units, anything else is implausible.
+IMPEDANCE_MODE_AUTO = "auto"
+IMPEDANCE_MODE_TENTHS = "tenths"
+IMPEDANCE_MODE_OHMS = "ohms"
+
+
+def impedance_to_ohm(raw: int, mode: str = IMPEDANCE_MODE_AUTO) -> float | None:
+    """Convert one raw impedance word to ohm, or ``None`` if implausible."""
+    if raw is None or raw <= 0:
+        return None
+    if mode == IMPEDANCE_MODE_TENTHS:
+        return raw / 10.0
+    if mode == IMPEDANCE_MODE_OHMS:
+        return float(raw)
+    if raw < 1000:
+        return float(raw)
+    if raw <= 39999:
+        return raw / 10.0
+    return None
+
+
+# --------------------------------------------------------------------------
+# Incoming payloads — vendor (Hagrid) measurement
 # --------------------------------------------------------------------------
 
 
@@ -432,6 +493,19 @@ def _read_timestamp(data: bytes, offset: int) -> datetime | None:
         return None
 
 
+#: Lengths the Scale 3 is known to send: 26 bytes without, 38 bytes with the
+#: high-frequency impedance block. The Scale 3 Pro advertises dual-frequency
+#: measurement, so its packet is expected to be the 38-byte variant — but it is
+#: not guaranteed, hence the tolerant mode below.
+REALTIME_LENGTHS = frozenset({26, 38})
+HISTORY_LENGTHS = frozenset({27, 28, 39, 40})
+#: Tolerant mode: any length from the smallest known packet up to a sane cap is
+#: accepted, so an unknown firmware variant still yields weight/fat/impedance
+#: instead of nothing (the tail is kept as hex for diagnostics).
+MIN_MEASUREMENT_BYTES = 26
+MAX_MEASUREMENT_BYTES = 128
+
+
 @dataclass(frozen=True)
 class WeightMeasurement:
     raw_length: int
@@ -439,22 +513,43 @@ class WeightMeasurement:
     fat_percent: float
     #: Scale-local wall clock time; ``None`` if the bytes did not decode.
     timestamp: datetime | None
+    #: Raw impedance words as sent (unit conversion happens in the accessors).
     low_impedance: tuple[int, ...]
     high_impedance: tuple[int, ...]
     heart_rate: int | None
     history_suspected_flag: int | None = None
     history_complete_flag: int | None = None
+    #: Bytes past the known layout (Scale 3 Pro: extra segmental data?), hex.
+    trailing_hex: str | None = None
+    #: The complete payload as received, for capture/debugging.
+    raw_payload: bytes = b""
+    #: Set when the packet came from a Bluetooth SIG standard characteristic.
+    source: str = "hagrid"
+
+    def _first_ohm(self, values: tuple[int, ...], mode: str) -> float | None:
+        for raw in values:
+            ohm = impedance_to_ohm(raw, mode)
+            if ohm is not None:
+                return ohm
+        return None
+
+    def low_ohm_all(self, mode: str = IMPEDANCE_MODE_AUTO) -> tuple[float | None, ...]:
+        return tuple(impedance_to_ohm(raw, mode) for raw in self.low_impedance)
+
+    def high_ohm_all(self, mode: str = IMPEDANCE_MODE_AUTO) -> tuple[float | None, ...]:
+        return tuple(impedance_to_ohm(raw, mode) for raw in self.high_impedance)
+
+    def impedance_ohm(self, mode: str = IMPEDANCE_MODE_AUTO) -> float | None:
+        """Representative low-frequency (whole-body) impedance in ohm."""
+        return self._first_ohm(self.low_impedance, mode)
+
+    def impedance_high_ohm(self, mode: str = IMPEDANCE_MODE_AUTO) -> float | None:
+        """Representative high-frequency impedance in ohm (dual-frequency only)."""
+        return self._first_ohm(self.high_impedance, mode)
 
     @property
-    def impedance_ohm(self) -> float | None:
-        """Low-frequency impedance in ohm.
-
-        The Scale 3 reports it in 0.1 ohm units (a real 350 ohm arrives as
-        3500), per the openScale driver.
-        """
-        if self.low_impedance and self.low_impedance[0] > 0:
-            return self.low_impedance[0] / 10.0
-        return None
+    def has_high_frequency(self) -> bool:
+        return bool(self.high_impedance)
 
     @property
     def is_history_complete(self) -> bool | None:
@@ -478,10 +573,18 @@ class WeightMeasurement:
 
 
 def _parse_weight_measurement(
-    payload: bytes, allowed_lengths: frozenset[int], timestamp_required: bool
+    payload: bytes,
+    allowed_lengths: frozenset[int],
+    timestamp_required: bool,
+    *,
+    tolerant: bool = False,
 ) -> WeightMeasurement | None:
-    if len(payload) not in allowed_lengths:
+    if tolerant:
+        if not MIN_MEASUREMENT_BYTES <= len(payload) <= MAX_MEASUREMENT_BYTES:
+            return None
+    elif len(payload) not in allowed_lengths:
         return None
+
     high_present = len(payload) >= 38
     base = 38 if high_present else 26
 
@@ -492,6 +595,7 @@ def _parse_weight_measurement(
     low = tuple(_u16(payload, 12 + i * 2) for i in range(6))
     high = tuple(_u16(payload, 26 + i * 2) for i in range(6)) if high_present else ()
     hr_raw = _u16(payload, 24)
+    trailing = payload[base:].hex().upper() if len(payload) > base else None
     return WeightMeasurement(
         raw_length=len(payload),
         weight_kg=_u16(payload, 0) / 100.0,
@@ -502,17 +606,27 @@ def _parse_weight_measurement(
         heart_rate=hr_raw if 1 <= hr_raw <= 240 else None,
         history_suspected_flag=payload[base] if len(payload) > base else None,
         history_complete_flag=payload[base + 1] if len(payload) > base + 1 else None,
+        trailing_hex=trailing,
+        raw_payload=bytes(payload),
     )
 
 
-def parse_realtime_measurement(payload: bytes) -> WeightMeasurement | None:
+def parse_realtime_measurement(
+    payload: bytes, *, tolerant: bool = False
+) -> WeightMeasurement | None:
     """Live measurement. A bad timestamp does not reject the packet."""
-    return _parse_weight_measurement(payload, frozenset({26, 38}), False)
+    return _parse_weight_measurement(
+        payload, REALTIME_LENGTHS, False, tolerant=tolerant
+    )
 
 
-def parse_history_measurement(payload: bytes) -> WeightMeasurement | None:
+def parse_history_measurement(
+    payload: bytes, *, tolerant: bool = False
+) -> WeightMeasurement | None:
     """Stored record. A valid timestamp is mandatory."""
-    return _parse_weight_measurement(payload, frozenset({27, 28, 39, 40}), True)
+    return _parse_weight_measurement(
+        payload, HISTORY_LENGTHS, True, tolerant=tolerant
+    )
 
 
 def _decode_text(raw: bytes) -> str:
@@ -585,7 +699,7 @@ def parse_weight_unit(payload: bytes) -> WeightUnit | None:
 
 
 def parse_product_id(payload: bytes) -> str | None:
-    """First four ASCII characters of the product-info payload (e.g. ``M0CJ``)."""
+    """First four ASCII characters of the product-info payload (e.g. ``M00F``)."""
     text = _decode_text(payload)
     if not text or text.startswith("hex:"):
         return None
@@ -593,32 +707,300 @@ def parse_product_id(payload: bytes) -> str | None:
 
 
 # --------------------------------------------------------------------------
+# Incoming payloads — Bluetooth SIG standard characteristics
+# --------------------------------------------------------------------------
+
+_KG_PER_UNIT = 0.005  # 0x2A9D / 0x2A9C weight resolution in SI units
+_LB_PER_UNIT = 0.01
+LB_TO_KG = 0.45359237
+
+
+def parse_standard_weight_measurement(payload: bytes) -> WeightMeasurement | None:
+    """Decode a SIG ``0x2A9D`` Weight Measurement (weight only).
+
+    Flags (byte 0): bit0 imperial units, bit1 timestamp present, bit2 user id
+    present, bit3 BMI and height present. Used as a fallback for firmwares that
+    answer on the standard characteristic instead of the vendor one.
+    """
+    if len(payload) < 3:
+        return None
+    flags = payload[0]
+    imperial = bool(flags & 0x01)
+    raw = _u16(payload, 1)
+    weight_kg = raw * (_LB_PER_UNIT * LB_TO_KG if imperial else _KG_PER_UNIT)
+    offset = 3
+    timestamp = None
+    if flags & 0x02:
+        timestamp = _read_timestamp(payload, offset)
+        offset += 7
+    if flags & 0x04:
+        offset += 1  # user id
+    if flags & 0x08:
+        offset += 2  # BMI
+        offset += 2  # height
+    if weight_kg <= 0:
+        return None
+    return WeightMeasurement(
+        raw_length=len(payload),
+        weight_kg=weight_kg,
+        fat_percent=0.0,
+        timestamp=timestamp,
+        low_impedance=(),
+        high_impedance=(),
+        heart_rate=None,
+        raw_payload=bytes(payload),
+        source="standard_weight",
+    )
+
+
+def parse_standard_body_composition_measurement(
+    payload: bytes,
+) -> WeightMeasurement | None:
+    """Decode a SIG ``0x2A9C`` Body Composition Measurement.
+
+    Only the fields this integration can use are returned (body fat, weight,
+    impedance, timestamp). Everything else is left in the payload for the
+    capture log.
+    """
+    if len(payload) < 4:
+        return None
+    flags = _u16(payload, 0)
+    imperial = bool(flags & 0x0001)
+    offset = 2
+    fat_raw = _u16(payload, offset)
+    offset += 2
+    timestamp = None
+    if flags & 0x0002:
+        timestamp = _read_timestamp(payload, offset)
+        offset += 7
+    if flags & 0x0004:
+        offset += 1  # user id
+    # Optional fields in the order defined by the spec.
+    for bit, size in ((3, 2), (4, 2), (5, 2), (6, 2), (7, 2), (8, 2)):
+        if flags & (1 << bit):
+            offset += size
+    impedance = None
+    if flags & (1 << 9):
+        if offset + 2 <= len(payload):
+            impedance = _u16(payload, offset)
+        offset += 2
+    weight_kg = 0.0
+    if flags & (1 << 10) and offset + 2 <= len(payload):
+        raw = _u16(payload, offset)
+        weight_kg = raw * (_LB_PER_UNIT * LB_TO_KG if imperial else _KG_PER_UNIT)
+        offset += 2
+    if weight_kg <= 0 and impedance is None and fat_raw == 0:
+        return None
+    return WeightMeasurement(
+        raw_length=len(payload),
+        weight_kg=weight_kg,
+        fat_percent=fat_raw / 10.0,
+        timestamp=timestamp,
+        low_impedance=(impedance,) if impedance else (),
+        high_impedance=(),
+        heart_rate=None,
+        raw_payload=bytes(payload),
+        source="standard_body",
+    )
+
+
+def parse_any_measurement(
+    kind: str, payload: bytes, *, tolerant: bool = False
+) -> WeightMeasurement | None:
+    """Route a payload by the characteristic it arrived on."""
+    if kind == "standard_weight":
+        return parse_standard_weight_measurement(payload)
+    if kind == "standard_body":
+        return parse_standard_body_composition_measurement(payload)
+    return parse_realtime_measurement(payload, tolerant=tolerant)
+
+
+# --------------------------------------------------------------------------
 # Device identification
 # --------------------------------------------------------------------------
 
-#: Local names / ASCII markers that identify a Scale 3. ``HUAWEI SCALE 3 PRO``
-#: also contains ``HUAWEI SCALE 3`` and is a different (unsupported) device.
-SCALE_3_MARKERS = ("M00D", "HEM-B19", "HERM-B19", "HUAWEI SCALE 3")
-OTHER_HAGRID_MARKERS = (
-    "HUAWEI SCALE 3 PRO",
-    "HAGRID-B29",
-    "HAGRID2021-B19",
-    "M00F",
-    "HUAWEI SCALE 2 PRO",
-    "HAG-B19",
-    "HAGRID-B19",
-    "007B",
-    "HONOR SCALE 2",
-    "LUP-B19",
-    "LUPIN-B19HN",
-    "N001",
-    "DOBBY-B19",
-    "M0CJ",
+
+class Family:
+    """Hagrid product families, as in openScale's ``HagridProductFamily``."""
+
+    SCALE_2_PRO = "scale2_pro"
+    SCALE_3_PRO = "scale3_pro"
+    SCALE_3 = "scale3"
+    HONOR_SCALE_2 = "honor_scale2"
+    DOBBY = "dobby"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ProductProfile:
+    """What a matched advertisement tells us about the scale."""
+
+    family: str
+    display_name: str
+    smart_product_id: str | None
+    #: ``True`` for dual-frequency families (Scale 3 Pro), ``False`` for the
+    #: single-frequency ones, ``None`` when unknown.
+    expected_high_frequency_impedance: bool | None
+    #: Value of byte 62 in the encrypted user profile, per openScale: the plain
+    #: Scale 3 uses male=1/female=0, every other family the other way round.
+    gender_male: int
+    gender_female: int
+
+    @property
+    def is_scale3(self) -> bool:
+        return self.family == Family.SCALE_3
+
+    @property
+    def is_scale3_pro(self) -> bool:
+        return self.family == Family.SCALE_3_PRO
+
+    @property
+    def has_handle(self) -> bool:
+        """8-electrode device (the Scale 3 Pro has a handle with electrodes)."""
+        return self.is_scale3_pro
+
+    @property
+    def needs_tolerant_parsing(self) -> bool:
+        """Families other than the plain Scale 3 may send unfamiliar lengths."""
+        return self.family != Family.SCALE_3
+
+
+#: (marker, family) — order does not matter, the longest match wins, so that
+#: ``HUAWEI SCALE 3 PRO`` is not mistaken for ``HUAWEI SCALE 3``.
+PRODUCT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("HUAWEI SCALE 2 PRO", Family.SCALE_2_PRO),
+    ("HAG-B19", Family.SCALE_2_PRO),
+    ("HAGRID-B19", Family.SCALE_2_PRO),
+    ("007B", Family.SCALE_2_PRO),
+    ("HUAWEI SCALE 3 PRO", Family.SCALE_3_PRO),
+    ("HAGRID-B29", Family.SCALE_3_PRO),
+    ("HAGRID2021-B19", Family.SCALE_3_PRO),
+    ("M00F", Family.SCALE_3_PRO),
+    ("HUAWEI SCALE 3", Family.SCALE_3),
+    ("HEM-B19", Family.SCALE_3),
+    ("HERM-B19", Family.SCALE_3),
+    ("M00D", Family.SCALE_3),
+    ("HONOR SCALE 2", Family.HONOR_SCALE_2),
+    ("LUP-B19", Family.HONOR_SCALE_2),
+    ("LUPIN-B19HN", Family.HONOR_SCALE_2),
+    ("N001", Family.HONOR_SCALE_2),
+    ("DOBBY-B19", Family.DOBBY),
+    ("M0CJ", Family.DOBBY),
 )
+
+_PROFILES: dict[str, ProductProfile] = {
+    Family.SCALE_3_PRO: ProductProfile(
+        family=Family.SCALE_3_PRO,
+        display_name="HUAWEI Scale 3 Pro",
+        smart_product_id="M00F",
+        expected_high_frequency_impedance=True,
+        gender_male=0,
+        gender_female=1,
+    ),
+    Family.SCALE_3: ProductProfile(
+        family=Family.SCALE_3,
+        display_name="HUAWEI Scale 3",
+        smart_product_id="M00D",
+        expected_high_frequency_impedance=False,
+        gender_male=1,
+        gender_female=0,
+    ),
+    Family.SCALE_2_PRO: ProductProfile(
+        family=Family.SCALE_2_PRO,
+        display_name="HUAWEI Scale 2 Pro",
+        smart_product_id="007B",
+        expected_high_frequency_impedance=False,
+        gender_male=0,
+        gender_female=1,
+    ),
+    Family.HONOR_SCALE_2: ProductProfile(
+        family=Family.HONOR_SCALE_2,
+        display_name="HONOR Scale 2",
+        smart_product_id="N001",
+        expected_high_frequency_impedance=False,
+        gender_male=0,
+        gender_female=1,
+    ),
+    Family.DOBBY: ProductProfile(
+        family=Family.DOBBY,
+        display_name="Huawei/Honor WSP Scale",
+        smart_product_id="M0CJ",
+        expected_high_frequency_impedance=None,
+        gender_male=0,
+        gender_female=1,
+    ),
+    Family.UNKNOWN: ProductProfile(
+        family=Family.UNKNOWN,
+        display_name="Huawei/Honor WSP Scale",
+        smart_product_id=None,
+        expected_high_frequency_impedance=None,
+        gender_male=0,
+        gender_female=1,
+    ),
+}
+
+#: Family keys that can be forced in the options flow (``generic`` → UNKNOWN).
+MODEL_FAMILY_ALIASES: dict[str, str] = {
+    "scale3_pro": Family.SCALE_3_PRO,
+    "scale3": Family.SCALE_3,
+    "scale2_pro": Family.SCALE_2_PRO,
+    "honor_scale2": Family.HONOR_SCALE_2,
+    "generic": Family.UNKNOWN,
+}
+
+
+def profile_for_family(family: str) -> ProductProfile:
+    return _PROFILES.get(family, _PROFILES[Family.UNKNOWN])
+
+
+def product_profile_for_marker(marker: str | None) -> ProductProfile:
+    """Map a product marker (name fragment / product id) to a profile."""
+    text = (marker or "").strip().upper()
+    if not text:
+        return profile_for_family(Family.UNKNOWN)
+    best: tuple[int, str] | None = None
+    for needle, family in PRODUCT_MARKERS:
+        if needle in text and (best is None or len(needle) > best[0]):
+            best = (len(needle), family)
+    return profile_for_family(best[1] if best else Family.UNKNOWN)
 
 
 def _ascii_view(raw: bytes) -> str:
     return "".join(chr(b) if 0x20 <= b <= 0x7E else " " for b in raw)
+
+
+def advertisement_texts(
+    name: str | None,
+    manufacturer_data: dict[int, bytes] | None = None,
+    service_data: dict[str, bytes] | None = None,
+) -> list[str]:
+    texts = [name or ""]
+    texts += [_ascii_view(v) for v in (manufacturer_data or {}).values()]
+    texts += [_ascii_view(v) for v in (service_data or {}).values()]
+    return texts
+
+
+def identify_hagrid(
+    name: str | None,
+    manufacturer_data: dict[int, bytes] | None = None,
+    service_data: dict[str, bytes] | None = None,
+) -> ProductProfile | None:
+    """Return the product profile if the advertisement is a Hagrid scale.
+
+    Mirrors the openScale driver: look for a product marker in the local name
+    or as ASCII inside the manufacturer / service data; the longest matching
+    marker wins. A Scale 3 Pro is therefore reported as SCALE_3_PRO even though
+    its name also contains the Scale 3 marker.
+    """
+    best: tuple[int, str] | None = None
+    for text in advertisement_texts(name, manufacturer_data, service_data):
+        upper = text.upper()
+        for needle, family in PRODUCT_MARKERS:
+            if needle in upper and (best is None or len(needle) > best[0]):
+                best = (len(needle), family)
+    if best is None:
+        return None
+    return profile_for_family(best[1])
 
 
 def identify_scale_3(
@@ -626,18 +1008,48 @@ def identify_scale_3(
     manufacturer_data: dict[int, bytes] | None = None,
     service_data: dict[str, bytes] | None = None,
 ) -> bool:
-    """True if the advertisement looks like a Huawei Scale 3.
+    """True only for the plain Scale 3 (kept for API compatibility)."""
+    profile = identify_hagrid(name, manufacturer_data, service_data)
+    return profile is not None and profile.is_scale3
 
-    Mirrors the openScale driver: look for a product marker in the local name
-    or as ASCII inside the manufacturer / service data.
-    """
-    texts = [name or ""]
-    texts += [_ascii_view(v) for v in (manufacturer_data or {}).values()]
-    texts += [_ascii_view(v) for v in (service_data or {}).values()]
-    for text in texts:
-        upper = text.upper()
-        if any(marker in upper for marker in OTHER_HAGRID_MARKERS):
-            return False
-        if any(marker in upper for marker in SCALE_3_MARKERS):
-            return True
-    return False
+
+# --------------------------------------------------------------------------
+# Advertised capability bits
+# --------------------------------------------------------------------------
+
+#: openScale: bit 18 of the advertised capability bits means "high-frequency
+#: (dual-frequency) impedance", i.e. a Scale 3 Pro class device.
+CAPABILITY_BIT_HIGH_FREQUENCY_IMPEDANCE = 18
+
+_CAPABILITY_RE = re.compile(
+    r"(?:capacity|capability|caps?)[:=]([0-9a-f]+)", re.IGNORECASE
+)
+
+
+def parse_capability_bits(hex_text: str | None) -> set[int]:
+    """Decode the ``capacity=…`` hex blob from an advertisement into bit numbers."""
+    cleaned = "".join(
+        c for c in (hex_text or "") if c.isdigit() or c.lower() in "abcdef"
+    ).upper()
+    if not cleaned or len(cleaned) % 2:
+        return set()
+    bits: set[int] = set()
+    for byte_index in range(len(cleaned) // 2):
+        value = int(cleaned[byte_index * 2 : byte_index * 2 + 2], 16)
+        for bit in range(8):
+            if value & (1 << bit):
+                bits.add(byte_index * 8 + bit)
+    return bits
+
+
+def find_capability_bits(
+    name: str | None,
+    manufacturer_data: dict[int, bytes] | None = None,
+    service_data: dict[str, bytes] | None = None,
+) -> set[int]:
+    """Search an advertisement for the capability blob and decode it."""
+    for text in advertisement_texts(name, manufacturer_data, service_data):
+        match = _CAPABILITY_RE.search(text)
+        if match:
+            return parse_capability_bits(match.group(1))
+    return set()

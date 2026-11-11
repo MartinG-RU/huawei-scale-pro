@@ -1,0 +1,318 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Choose your Huawei scale",
+        "description": "The scale only shows up while someone is standing on it. Step on it now and reopen this dialog if it is not listed, or type its Bluetooth address (AA:BB:CC:DD:EE:FF). {recognised} recognised device(s) found.",
+        "data": {
+          "address": "Bluetooth address"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Set up {model}",
+        "description": "Found {name} ({address}), recognised as {model}. Next you will enter your profile."
+      },
+      "profile": {
+        "title": "Your profile",
+        "description": "The scale needs your sex, age and height before it can measure, and the integration uses them to calculate body composition. The starting weight is only used until the first measurement.",
+        "data": {
+          "name": "Name",
+          "sex": "Sex",
+          "birth_date": "Date of birth",
+          "height_cm": "Height",
+          "initial_weight_kg": "Starting weight"
+        },
+        "data_description": {
+          "birth_date": "Type it as YYYY-MM-DD (1985-03-27) or DD/MM/YYYY (27/03/1985)."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Authentication failed",
+        "description": "{name} rejected the authentication several times in a row. Enter a custom key (CAK, C1 and C2 concatenated, 96 hexadecimal characters) to override the built-in one, or leave this blank to retry with the built-in key.",
+        "data": {
+          "auth_key": "Authentication key"
+        }
+      }
+    },
+    "error": {
+      "invalid_address": "Enter a Bluetooth address like AA:BB:CC:DD:EE:FF.",
+      "invalid_key": "Enter exactly 96 hexadecimal characters (CAK, C1 and C2 concatenated), or leave it blank.",
+      "name_required": "Enter a name.",
+      "name_exists": "A profile with this name already exists.",
+      "invalid_birth_date": "Enter a valid date of birth in the past, as YYYY-MM-DD or DD/MM/YYYY."
+    },
+    "abort": {
+      "already_configured": "This scale is already set up.",
+      "not_supported": "This device is not a Huawei Hagrid-family scale.",
+      "reauth_successful": "The authentication key was updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Huawei Scale 3 Pro options",
+        "menu_options": {
+          "settings": "Behaviour and model",
+          "add_profile": "Add a person",
+          "remove_profile": "Remove a person",
+          "guest": "Guest and guest data"
+        }
+      },
+      "settings": {
+        "title": "Behaviour and model",
+        "description": "Detected model: {model} (from {source}). History import fires an event for measurements stored on the scale that were taken while Home Assistant could not hear it. Frame capture keeps the raw BLE traffic so an unrecognised firmware can be diagnosed: weigh in once, then download the diagnostics or call huawei_scale_pro.dump_frames. Gender encoding and impedance units only need changing if the scale rejects the profile or the body-composition numbers are clearly wrong.\n\nRecognising the person by weight reassigns a weigh-in to the profile whose recent weights match — useful when more than one person uses the scale. The first weigh-in of each person must be done with the right profile selected: the scale needs the profile before it measures, so it cannot be chosen from the weight it has not measured yet. After that the selection follows the person automatically.\n\nA weight that matches nobody within the tolerance is treated as a one-off guest weigh-in: it does not overwrite anyone's sensors and is not used to recognise people later. If the same unusual weight repeats, it is taken as a real change of the selected person's weight and their history is restarted.",
+        "data": {
+          "read_history": "Read stored measurements from the scale",
+          "cooldown": "Cool-down after a weigh-in",
+          "capture_frames": "Capture raw BLE frames",
+          "model": "Model",
+          "gender_encoding": "Gender encoding in the user profile",
+          "impedance_units": "Raw impedance units",
+          "prefer_scale_body_fat": "Huawei Health formulas: take the body fat from the scale and split the rest into water, protein and mineral (recommended). Turn off to compute everything from the impedance with the openScale model.",
+          "user_match": "Recognise the person by weight",
+          "user_match_tolerance_kg": "How far the weight may deviate"
+        }
+      },
+      "add_profile": {
+        "title": "Add a person",
+        "data": {
+          "name": "Name",
+          "sex": "Sex",
+          "birth_date": "Date of birth",
+          "height_cm": "Height",
+          "initial_weight_kg": "Starting weight"
+        },
+        "data_description": {
+          "birth_date": "Type it as YYYY-MM-DD (1985-03-27) or DD/MM/YYYY (27/03/1985)."
+        }
+      },
+      "remove_profile": {
+        "title": "Remove a person",
+        "data": {
+          "name": "Person to remove"
+        }
+      },
+      "guest": {
+        "title": "Guest and guest data",
+        "description": "A guest is a mode, not a person: their weigh-in goes to no profile, is never used to recognise people by weight, and lives only on the \"Guest data\" device. Pick it in the \"Who is weighing\" list next to the profiles.\n\nThe scale needs height, age and sex before it measures, and nobody knows a visitor's. Leave the fields blank and the height is guessed from the guest's weight and the age from the resulting BMI — enough for the scale to report a composition. Anything typed here wins over the guess.",
+        "data": {
+          "guest_aftermath": "After a guest weigh-in",
+          "guest_height_cm": "Guest height (if known)",
+          "guest_age": "Guest age (if known)",
+          "guest_sex": "Guest sex (if known)"
+        },
+        "data_description": {
+          "guest_aftermath": "\"Keep the data\" leaves the guest reading on its own sensors and the scale keeps working as usual. \"Wait for a person\" stops weighing altogether until a person is selected, so repeat guest weigh-ins cannot overwrite the guest sensors and nobody's data is touched.",
+          "guest_height_cm": "Blank: the height is derived from the weight.",
+          "guest_age": "Blank: the age is derived from height and weight.",
+          "guest_sex": "Nothing chosen counts as male."
+        }
+      }
+    },
+    "error": {
+      "name_required": "Enter a name.",
+      "name_exists": "A profile with this name already exists.",
+      "invalid_birth_date": "Enter a valid date of birth in the past, as YYYY-MM-DD or DD/MM/YYYY."
+    }
+  },
+  "selector": {
+    "sex": {
+      "options": {
+        "male": "Male",
+        "female": "Female"
+      }
+    },
+    "model": {
+      "options": {
+        "auto": "Detect automatically",
+        "scale3_pro": "HUAWEI Scale 3 Pro",
+        "scale3": "HUAWEI Scale 3",
+        "scale2_pro": "HUAWEI Scale 2 Pro",
+        "honor_scale2": "HONOR Scale 2",
+        "generic": "Other Hagrid-family scale"
+      }
+    },
+    "gender_encoding": {
+      "options": {
+        "auto": "Per detected model",
+        "scale3": "Scale 3 style (male=1, female=0)",
+        "inverted": "All other families (male=0, female=1)"
+      }
+    },
+    "impedance_units": {
+      "options": {
+        "auto": "Automatic (heuristic)",
+        "tenths": "0.1 ohm units",
+        "ohms": "ohm"
+      }
+    },
+    "user_match": {
+      "options": {
+        "history": "From weigh-ins (first one manual)",
+        "history_and_initial": "From weigh-ins + profile weight",
+        "off": "Off (always the selected profile)"
+      }
+    },
+    "guest_aftermath": {
+      "options": {
+        "keep": "Keep the data",
+        "pause": "Wait for a person"
+      }
+    },
+    "guest_sex": {
+      "options": {
+        "male": "Male",
+        "female": "Female"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "weight": {
+        "name": "Weight"
+      },
+      "bmi": {
+        "name": "BMI"
+      },
+      "body_fat": {
+        "name": "Body fat"
+      },
+      "body_water": {
+        "name": "Body water"
+      },
+      "skeletal_muscle": {
+        "name": "Skeletal muscle"
+      },
+      "bone_mass": {
+        "name": "Bone mass"
+      },
+      "lean_body_mass": {
+        "name": "Lean body mass"
+      },
+      "protein": {
+        "name": "Protein"
+      },
+      "bmr": {
+        "name": "Basal metabolic rate"
+      },
+      "visceral_fat": {
+        "name": "Visceral fat"
+      },
+      "heart_rate": {
+        "name": "Heart rate"
+      },
+      "impedance": {
+        "name": "Low-frequency impedance"
+      },
+      "impedance_high": {
+        "name": "High-frequency impedance"
+      },
+      "measured_user": {
+        "name": "Measured user"
+      },
+      "last_measurement": {
+        "name": "Last measurement"
+      },
+      "model": {
+        "name": "Model"
+      },
+      "status": {
+        "name": "Status",
+        "state": {
+          "idle": "Idle",
+          "connecting": "Connecting",
+          "authenticating": "Authenticating",
+          "syncing": "Syncing profile",
+          "measuring": "Measuring",
+          "reading_history": "Reading history",
+          "error": "Error",
+          "auth_error": "Authentication failed",
+          "guest": "Guest",
+          "paused": "Paused after a guest"
+        }
+      },
+      "muscle_index": {
+        "name": "Skeletal muscle index"
+      },
+      "body_age": {
+        "name": "Biological age"
+      },
+      "physique": {
+        "name": "Physique",
+        "state": {
+          "slim": "Slim",
+          "athletic": "Athletic",
+          "normal": "Normal",
+          "overweight": "Overweight",
+          "obese": "Obese"
+        }
+      },
+      "body_water_kg": {
+        "name": "Body water mass"
+      },
+      "protein_kg": {
+        "name": "Protein mass"
+      },
+      "skeletal_muscle_kg": {
+        "name": "Skeletal muscle mass"
+      },
+      "guest_weight": {
+        "name": "Guest weight"
+      },
+      "guest_body_fat": {
+        "name": "Guest body fat"
+      },
+      "guest_body_water": {
+        "name": "Guest body water"
+      },
+      "guest_skeletal_muscle": {
+        "name": "Guest skeletal muscle"
+      },
+      "guest_bmr": {
+        "name": "Guest BMR"
+      },
+      "guest_impedance": {
+        "name": "Guest impedance (low frequency)"
+      },
+      "guest_measured_at": {
+        "name": "Guest measured at"
+      }
+    },
+    "select": {
+      "active_user": {
+        "name": "Who is weighing"
+      }
+    },
+    "button": {
+      "measure": {
+        "name": "Weigh in now"
+      },
+      "forget_guest": {
+        "name": "Forget guest"
+      }
+    }
+  },
+  "services": {
+    "dump_frames": {
+      "name": "Dump BLE frames",
+      "description": "Writes the captured BLE frames to a file in the configuration folder and returns them.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry",
+          "description": "Only dump this config entry (all of them by default)."
+        }
+      }
+    },
+    "measure": {
+      "name": "Weigh in now",
+      "description": "Start a session immediately: the scale is connected and the integration waits for the measurement for up to ~2.5 minutes, so step on the scale right after calling this.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry",
+          "description": "Only this config entry (all of them by default)."
+        }
+      }
+    }
+  }
+}

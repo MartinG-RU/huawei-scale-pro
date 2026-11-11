@@ -1,28 +1,41 @@
-"""A simulated Huawei Scale 3 for exercising ``Scale3Session`` without hardware.
+"""A simulated Huawei Hagrid scale for exercising ``ScaleSession`` without hardware.
 
 It implements the *scale side* of the protocol as documented by the openScale
 driver, built on the same primitives as the production code. It therefore
 proves the session logic is self-consistent and handles framing, encryption and
 ordering; it cannot prove the real firmware behaves the same way.
+
+The fake can be told to behave like a Scale 3 Pro: send the 38-byte
+dual-frequency packet, use the inverted gender encoding (checked by the tests
+via the recorded user profile), answer only on an unfamiliar characteristic, or
+answer only through the Bluetooth SIG standard characteristic.
 """
 from __future__ import annotations
 
 import asyncio
 
-from custom_components.huawei_scale3 import protocol as p
-from custom_components.huawei_scale3.session import Secrets
+from custom_components.huawei_scale_pro import protocol as p
+from custom_components.huawei_scale_pro.session import Secrets
 
 SCALE_RAND_A = bytes(range(0xA0, 0xB0))
 
+#: A characteristic the integration knows nothing about, used to prove that
+#: probe mode discovers and decodes an unfamiliar firmware's channel.
+PROBE_UUID = "11112222-3333-4444-5555-666677778888"
+
 
 class FakeChar:
-    def __init__(self, uuid: str) -> None:
+    def __init__(self, uuid: str, properties: tuple[str, ...] = ("notify",)) -> None:
         self.uuid = uuid
+        self.properties = list(properties)
 
 
 class FakeService:
-    def __init__(self, uuids: list[str]) -> None:
-        self._chars = {u: FakeChar(u) for u in uuids}
+    def __init__(self, uuids: list[str], extra: tuple[FakeChar, ...] = ()) -> None:
+        chars = [FakeChar(u) for u in uuids]
+        chars.extend(extra)
+        self.characteristics = chars
+        self._chars = {c.uuid: c for c in chars}
 
     def get_characteristic(self, uuid: str) -> FakeChar | None:
         return self._chars.get(uuid)
@@ -36,13 +49,22 @@ _WRITE_ONLY_CHARACTERISTICS: tuple[tuple[str, str], ...] = (
 
 
 class FakeServices:
-    def __init__(self) -> None:
+    def __init__(self, *, probe: bool = False, standard_only: bool = False) -> None:
         layout: dict[str, list[str]] = {}
         for service, characteristic, _kind in p.NOTIFY_CHARACTERISTICS:
+            if standard_only and characteristic == p.CHR_REALTIME_WEIGHT:
+                continue
             layout.setdefault(service, []).append(characteristic)
         for service, characteristic in _WRITE_ONLY_CHARACTERISTICS:
             layout.setdefault(service, []).append(characteristic)
-        self._services = {s: FakeService(c) for s, c in layout.items()}
+        extras: dict[str, tuple[FakeChar, ...]] = {}
+        if probe:
+            extras[p.SVC_BODY_COMPOSITION] = (
+                FakeChar(PROBE_UUID, ("notify", "indicate")),
+            )
+        self._services = {
+            s: FakeService(c, extras.get(s, ())) for s, c in layout.items()
+        }
 
     def get_service(self, uuid: str) -> FakeService | None:
         return self._services.get(uuid)
@@ -54,15 +76,25 @@ def realtime_payload(
     impedance_raw: int = 3625,
     heart_rate: int = 61,
     flags: bytes = b"",
+    high_impedance_raw: tuple[int, ...] | None = None,
+    extra: bytes = b"",
 ) -> bytes:
-    """26-byte realtime payload (+ optional history flag bytes)."""
-    out = bytearray(26)
+    """A realtime payload: 26 bytes, or 38 with the high-frequency block."""
+    out = bytearray(38 if high_impedance_raw is not None else 26)
     out[0:2] = round(weight_kg * 100).to_bytes(2, "little")
     out[2:4] = round(fat * 10).to_bytes(2, "little")
     out[4:11] = bytes([0xEA, 0x07, 0x08, 0x09, 0x17, 0x27, 0x1D])  # 2026-08-09 23:39:29
     out[12:14] = impedance_raw.to_bytes(2, "little")
     out[24:26] = heart_rate.to_bytes(2, "little")
-    return bytes(out) + flags
+    if high_impedance_raw is not None:
+        for index, raw in enumerate(high_impedance_raw[:6]):
+            out[26 + index * 2 : 28 + index * 2] = raw.to_bytes(2, "little")
+    return bytes(out) + flags + extra
+
+
+def standard_weight_payload(weight_kg: float = 86.25) -> bytes:
+    """Bluetooth SIG 0x2A9D Weight Measurement, SI units, no timestamp."""
+    return bytes([0x00]) + round(weight_kg / 0.005).to_bytes(2, "little")
 
 
 class FakeScale:
@@ -80,6 +112,10 @@ class FakeScale:
         answer_auth: bool = True,
         work_key_reply_encrypted: bool = True,
         with_gatt: bool = True,
+        probe: bool = False,
+        standard_only: bool = False,
+        deliver_from_probe: bool = False,
+        product_id: bytes = b"M00F1",
     ) -> None:
         self.address = address
         self.secrets = secrets
@@ -89,7 +125,13 @@ class FakeScale:
         self.reject_work_key = reject_work_key
         self.answer_auth = answer_auth
         self.work_key_reply_encrypted = work_key_reply_encrypted
-        self.services = FakeServices() if with_gatt else _EmptyServices()
+        self.services = (
+            FakeServices(probe=probe, standard_only=standard_only)
+            if with_gatt
+            else _EmptyServices()
+        )
+        self.deliver_from_probe = deliver_from_probe
+        self.product_id = product_id
 
         self.work_key: bytes | None = None
         self.user_info: bytes | None = None
@@ -206,9 +248,9 @@ class FakeScale:
             ready = self.polls >= self.status_ready_after
             self._notify(uuid, b"\x00" if ready else b"\x01")
             if ready and self.polls == self.status_ready_after:
-                self._notify(p.CHR_REALTIME_WEIGHT, self.realtime, encrypted=True)
+                self._deliver_measurement()
         elif uuid == p.CHR_PRODUCT_INFO:
-            self._notify(uuid, b"M00D1")
+            self._notify(uuid, self.product_id)
         elif uuid == p.CHR_SCALE_VERSION:
             bits = "0010" "0000" "0000" + format(70, "010b") + "00"
             self._notify(uuid, b"\x00" + int(bits, 2).to_bytes(3, "big") + b"SN1")
@@ -218,6 +260,15 @@ class FakeScale:
                 self._notify(uuid, self.history.pop(0), encrypted=True)
             else:
                 self._notify(uuid, b"", encrypted=True)
+
+    def _deliver_measurement(self) -> None:
+        """Send the ready payload on whichever channel this fake was told to use."""
+        if self.deliver_from_probe:
+            self._notify(PROBE_UUID, self.realtime, encrypted=True)
+        elif p.CHR_REALTIME_WEIGHT in self._callbacks:
+            self._notify(p.CHR_REALTIME_WEIGHT, self.realtime, encrypted=True)
+        elif p.CHR_WEIGHT_MEASUREMENT in self._callbacks:
+            self._notify(p.CHR_WEIGHT_MEASUREMENT, standard_weight_payload(86.25))
 
 
 class _EmptyServices:

@@ -1,0 +1,26 @@
+dump_frames:
+  name: Dump BLE frames
+  description: >-
+    Write the captured BLE frames of the last sessions to
+    huawei_scale_pro_frames.txt in the Home Assistant configuration folder and
+    return them as the service response.
+  fields:
+    entry_id:
+      name: Config entry
+      description: Only dump this config entry (all of them by default).
+      required: false
+      selector:
+        text:
+
+measure:
+  name: Weigh in now
+  description: >-
+    Start a scale session immediately and wait for the measurement, so the user
+    can step on the scale after calling this.
+  fields:
+    entry_id:
+      name: Config entry
+      description: Only start a session for this config entry.
+      required: false
+      selector:
+        text:

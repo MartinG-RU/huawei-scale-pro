@@ -1,4 +1,4 @@
-"""One connected session with a Huawei Scale 3.
+"""One connected session with a Huawei Hagrid scale (Scale 3 Pro family).
 
 Drives the openScale-documented flow over an already-connected bleak client:
 
@@ -10,17 +10,33 @@ Drives the openScale-documented flow over an already-connected bleak client:
    delivers a complete measurement
 6. optionally drain the stored history
 
-Pure asyncio; depends on the client only through ``services``,
-``start_notify`` and ``write_gatt_char`` so it can be exercised with a fake.
+Differences from the Scale 3 port this is based on, all aimed at the Scale 3 Pro:
+
+* the user-profile gender byte follows the *model* (only the plain Scale 3 uses
+  ``male = 1``; the Pro and the other families use ``male = 0``);
+* measurement payloads are parsed in a length-tolerant mode for families other
+  than the plain Scale 3, and extra bytes are kept for diagnostics;
+* a measurement is accepted from any source that delivers one: the vendor
+  realtime characteristic, the vendor body-composition/weight characteristics,
+  or the Bluetooth SIG standard ones (``0x2A9C`` / ``0x2A9D``), which some
+  firmwares use instead;
+* the dual-frequency (low + high) impedance blocks are both decoded;
+* optionally every frame is captured into a ring buffer and unknown notifiable
+  characteristics are subscribed too, so an unfamiliar firmware can be
+  diagnosed from a log instead of a serial console.
+
+Pure asyncio; depends on the client only through ``services``, ``start_notify``
+and ``write_gatt_char`` so it can be exercised with a fake.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -40,10 +56,15 @@ HISTORY_RECORD_TIMEOUT = 6.0
 MAX_HISTORY_RECORDS = 64
 #: Upper bound for the weighing itself (the scale needs ~20-25 s).
 MEASUREMENT_TIMEOUT = MAX_STATUS_POLLS * STATUS_POLL_INTERVAL + FINAL_REQUEST_GRACE
+#: How many unfamiliar notifiable characteristics the probe mode may subscribe
+#: to. Bluetooth proxies hold ~12 subscriptions per connection; the measure
+#: phase already uses up to eight, so this stays deliberately small.
+MAX_UNKNOWN_SUBSCRIPTIONS = 4
 
 SYNTHETIC_HUID_PREFIX = "openscale:"  # same format the openScale driver uses
 
-_STREAM_KINDS = frozenset({"realtime", "status", "history"})
+_STREAM_KINDS = frozenset({"realtime", "status", "history", "unknown"})
+_MEASUREMENT_KINDS = frozenset({"realtime", "standard_weight", "standard_body"})
 
 _NOTIFY_BY_CHARACTERISTIC = {
     char: (service, kind) for service, char, kind in p.NOTIFY_CHARACTERISTICS
@@ -61,9 +82,14 @@ _PHASE_MEASURE = (
     p.CHR_BIND_REQUEST,
     p.CHR_PRODUCT_INFO,
     p.CHR_SCALE_VERSION,
+    p.CHR_GET_WEIGHT_UNIT,
 )
 _PHASE_HISTORY = (p.CHR_HISTORY_WEIGHT,)
 _DISCONNECTED = "disconnected"
+
+GENDER_ENCODING_AUTO = "auto"
+GENDER_ENCODING_SCALE3 = "scale3"
+GENDER_ENCODING_INVERTED = "inverted"
 
 
 class SessionError(Exception):
@@ -101,12 +127,62 @@ class ScaleUser:
     weight_kg: float
 
 
+@dataclass
+class FrameRecord:
+    """One captured BLE frame."""
+
+    t: float
+    direction: str  # "tx" / "rx"
+    label: str
+    hex: str
+
+    def as_line(self) -> str:
+        return f"{self.t:8.3f} {self.direction} {self.label:<28} {self.hex}"
+
+
+@dataclass
+class FrameCapture:
+    """Ring buffer of the raw frames of recent sessions.
+
+    This is what makes an unsupported firmware debuggable: the user turns on
+    "capture frames", weighs in once and downloads the log from the integration
+    diagnostics (or the ``huawei_scale_pro.dump_frames`` service).
+    """
+
+    limit: int = 600
+    records: deque[FrameRecord] = field(default_factory=deque)
+
+    def add(self, direction: str, label: str, data: bytes) -> None:
+        self.records.append(
+            FrameRecord(t=round(time.monotonic(), 3), direction=direction,
+                        label=label, hex=data.hex().upper())
+        )
+        while len(self.records) > self.limit:
+            self.records.popleft()
+
+    def as_text(self) -> str:
+        return "\n".join(record.as_line() for record in self.records)
+
+    def as_list(self) -> list[dict[str, Any]]:
+        return [
+            {"t": r.t, "dir": r.direction, "label": r.label, "hex": r.hex}
+            for r in self.records
+        ]
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+
 def is_hex_key(value: str, byte_length: int = 16) -> bool:
     """True for a hex string encoding exactly ``byte_length`` bytes."""
-    return len(value) == byte_length * 2 and all(c in "0123456789abcdefABCDEF" for c in value)
+    return len(value) == byte_length * 2 and all(
+        c in "0123456789abcdefABCDEF" for c in value
+    )
 
 
-class Scale3Session:
+class ScaleSession:
+    """One connect → authenticate → profile sync → measure cycle."""
+
     def __init__(
         self,
         client: Any,
@@ -114,8 +190,13 @@ class Scale3Session:
         secrets: Secrets,
         user: ScaleUser,
         *,
+        model: p.ProductProfile | None = None,
         read_history: bool = False,
         metric: bool = True,
+        gender_encoding: str = GENDER_ENCODING_AUTO,
+        impedance_units: str = p.IMPEDANCE_MODE_AUTO,
+        capture: FrameCapture | None = None,
+        probe_unknown: bool = False,
         random_bytes: Callable[[int], bytes] = os.urandom,
         now: Callable[[], datetime] = datetime.now,
         on_state: Callable[[str], None] | None = None,
@@ -126,13 +207,18 @@ class Scale3Session:
         self._address = address
         self._secrets = secrets
         self._user = user
+        self._model = model or p.profile_for_family(p.Family.UNKNOWN)
         self._read_history = read_history
         self._metric = metric
+        self._gender_encoding = gender_encoding
+        self._impedance_units = impedance_units
+        self._capture = capture
+        self._probe_unknown = probe_unknown
         self._random = random_bytes
         self._now = now
         self._on_state = on_state or (lambda _s: None)
         self._on_measurement = on_measurement or (lambda _m, _l: None)
-        self._on_info = on_info or (lambda _k, _v: None)
+        self._on_info = on_info or (lambda *_a: None)
 
         self._work_key: bytes | None = None
         self._accumulators: dict[str, p.FrameAccumulator] = {}
@@ -142,7 +228,33 @@ class Scale3Session:
         self._active: dict[str, Any] = {}
         self._seen: dict[str, int] = {}
         self._last_status: int | None = None
+        self._pending_standard: p.WeightMeasurement | None = None
         self.measurement_published = False
+        self.published_measurement: p.WeightMeasurement | None = None
+
+    # ----------------------------------------------------------------- helpers
+
+    @property
+    def model(self) -> p.ProductProfile:
+        return self._model
+
+    @property
+    def tolerant_parsing(self) -> bool:
+        return self._model.needs_tolerant_parsing
+
+    def gender_byte(self) -> int:
+        """The scale's user-profile gender value for the configured model."""
+        if self._gender_encoding == GENDER_ENCODING_SCALE3:
+            return 1 if self._user.male else 0
+        if self._gender_encoding == GENDER_ENCODING_INVERTED:
+            return 0 if self._user.male else 1
+        return (
+            self._model.gender_male if self._user.male else self._model.gender_female
+        )
+
+    def _record(self, direction: str, label: str, data: bytes) -> None:
+        if self._capture is not None:
+            self._capture.add(direction, label, data)
 
     # ------------------------------------------------------------------ io
 
@@ -174,11 +286,12 @@ class Scale3Session:
             if uuid not in self._active:
                 await self._start_notify(uuid)
 
-    async def _start_notify(self, uuid: str) -> None:
-        service, kind = _NOTIFY_BY_CHARACTERISTIC[uuid]
+    async def _start_notify(self, uuid: str, kind: str | None = None) -> bool:
+        service, default_kind = _NOTIFY_BY_CHARACTERISTIC[uuid]
+        kind = kind or default_kind
         char = self._characteristic(service, uuid)
         if char is None:
-            return
+            return False
 
         def _callback(_sender: Any, data: bytearray, _kind: str = kind,
                       _uuid: str = uuid) -> None:
@@ -201,9 +314,10 @@ class Scale3Session:
                 # Optional characteristics must not abort the session.
                 level = logging.WARNING if uuid == p.CHR_REALTIME_WEIGHT else logging.DEBUG
                 _LOGGER.log(level, "Cannot subscribe to %s: %s", uuid, err)
-                return
+                return False
             self._active[uuid] = char
-            return
+            return True
+        return False
 
     async def _stop_notify(self, uuid: str) -> None:
         char = self._active.pop(uuid, None)
@@ -214,7 +328,51 @@ class Scale3Session:
         except Exception as err:  # noqa: BLE001 - best effort, the link may be going away
             _LOGGER.debug("Could not unsubscribe from %s: %s", uuid, err)
 
+    async def _subscribe_probe(self) -> None:
+        """Subscribe to notifiable characteristics we do not know about.
+
+        Only in probe mode: it is how an unknown firmware reveals itself (e.g. a
+        Scale 3 Pro that answers on a characteristic the Scale 3 never uses).
+        """
+        if not self._probe_unknown:
+            return
+        added = 0
+        for service_uuid in p.HAGRID_SERVICES:
+            try:
+                service = self._client.services.get_service(service_uuid)
+            except Exception:  # noqa: BLE001
+                continue
+            if service is None:
+                continue
+            for char in getattr(service, "characteristics", ()) or ():
+                uuid = str(char.uuid).lower()
+                if uuid in self._active or uuid in _NOTIFY_BY_CHARACTERISTIC:
+                    continue
+                props = {str(prop).lower() for prop in (char.properties or ())}
+                if not ({"notify", "indicate"} & props):
+                    continue
+                # Keep the total below the ~12-subscription ceiling of an
+                # ESPHome proxy so the known, important ones never get evicted.
+                if added >= MAX_UNKNOWN_SUBSCRIPTIONS or len(self._active) >= 11:
+                    return
+                if await self._start_notify_unknown(uuid, char):
+                    added += 1
+
+    async def _start_notify_unknown(self, uuid: str, char: Any) -> bool:
+        def _callback(_sender: Any, data: bytearray, _uuid: str = uuid) -> None:
+            self._on_notify(_uuid, "unknown", bytes(data))
+
+        try:
+            await self._client.start_notify(char, _callback)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Cannot probe %s: %s", uuid, err)
+            return False
+        self._active[uuid] = char
+        _LOGGER.debug("Probing unknown characteristic %s", uuid)
+        return True
+
     def _on_notify(self, uuid: str, kind: str, data: bytes) -> None:
+        self._record("rx", f"{kind}:{uuid[:8]}", data)
         if not p.has_notification_prefix(data):
             _LOGGER.debug("Ignoring unframed notification on %s (%d bytes)", uuid, len(data))
             return
@@ -231,7 +389,7 @@ class Scale3Session:
             except ValueError as err:
                 _LOGGER.debug("Cannot decrypt notification on %s: %s", uuid, err)
                 return
-        _LOGGER.debug("RX %s: %s", kind, payload.hex())
+        _LOGGER.debug("RX %s (%s): %s", kind, uuid, payload.hex())
         self._seen[kind] = self._seen.get(kind, 0) + 1
         self._inbox.put_nowait((kind, payload))
 
@@ -243,6 +401,7 @@ class Scale3Session:
         frames = encrypted_frames or p.build_write_frames(payload)
         _LOGGER.debug("TX %s (%d frame(s))", characteristic, len(frames))
         for frame in frames:
+            self._record("tx", characteristic[:8], frame)
             await self._client.write_gatt_char(char, frame, response=True)
         return True
 
@@ -294,6 +453,8 @@ class Scale3Session:
             unit = p.parse_weight_unit(payload)
             if unit:
                 _LOGGER.debug("Scale weight unit: %s", unit.label)
+        elif kind == "unknown":
+            _LOGGER.debug("Probe payload (%d bytes): %s", len(payload), payload.hex())
         else:
             _LOGGER.debug("Unhandled %s payload (%d bytes)", kind, len(payload))
 
@@ -304,7 +465,7 @@ class Scale3Session:
         if not self._active or self._characteristic(p.SVC_USER_DATA, p.CHR_REQUEST_AUTH) is None:
             raise SessionError(
                 "device does not expose the Huawei Hagrid GATT layout "
-                "(is this really a Huawei Scale 3?)"
+                f"(expected service {p.SVC_USER_DATA}); model {self._model.display_name}"
             )
         self._on_state("authenticating")
         await self._authenticate()
@@ -312,6 +473,7 @@ class Scale3Session:
         self._on_state("syncing")
         await self._sync_clock_and_profile()
         await self._subscribe(_PHASE_MEASURE)
+        await self._subscribe_probe()
         self._on_state("measuring")
         await self._measure()
         if self._read_history:
@@ -381,15 +543,20 @@ class Scale3Session:
 
         assert self._work_key is not None
         user = self._user
+        gender = self.gender_byte()
         user_info = p.build_user_info_payload(
             huid=self._manager_huid
             or SYNTHETIC_HUID_PREFIX + self._address.replace(":", "").upper(),
             uid=f"u:{user.user_id:08X}",
-            # Scale 3 uses male=1 / female=0 (the other Hagrid scales are inverted).
-            gender=1 if user.male else 0,
+            gender=gender,
             age_years=user.age,
             height_cm=int(round(user.height_cm)),
             weight_kg=user.weight_kg,
+        )
+        _LOGGER.debug(
+            "Sending profile for %s: gender byte %d (%s encoding, family %s)",
+            self._model.display_name, gender,
+            self._gender_encoding, self._model.family,
         )
         frames = p.build_encrypted_write_frames(user_info, self._work_key, self._random(16))
         if await self._write(p.SVC_USER_DATA, p.CHR_SET_USER_INFO, b"", encrypted_frames=frames):
@@ -409,6 +576,7 @@ class Scale3Session:
         for service, characteristic in (
             (p.SVC_CURRENT_TIME, p.CHR_PRODUCT_INFO),
             (p.SVC_CURRENT_TIME, p.CHR_SCALE_VERSION),
+            (p.SVC_CURRENT_TIME, p.CHR_GET_WEIGHT_UNIT),
         ):
             await self._write(service, characteristic, b"")
 
@@ -449,15 +617,24 @@ class Scale3Session:
             except TimeoutError:
                 continue
 
-            if kind == "realtime":
-                measurement = p.parse_realtime_measurement(payload)
+            if kind in _MEASUREMENT_KINDS or kind == "unknown":
+                measurement = self._measurement_from(kind, payload)
                 if measurement is None or measurement.weight_kg <= 0:
                     _LOGGER.debug(
-                        "Realtime payload ignored (%d bytes, parsed=%s)", len(payload), measurement
+                        "%s payload did not parse as a measurement (%d bytes): %s",
+                        kind, len(payload), payload.hex(),
                     )
                     continue
+                if kind in p.STANDARD_KINDS:
+                    # A standard-characteristic frame is a usable fallback, but a
+                    # vendor frame (which carries impedance) wins if one arrives.
+                    self._pending_standard = measurement
+                    if measurement.impedance_ohm(self._impedance_units) is not None:
+                        self._publish(measurement, live=True)
+                        return
+                    continue
                 pending = measurement
-                if measurement.impedance_ohm is not None:
+                if measurement.impedance_ohm(self._impedance_units) is not None:
                     # Weight + impedance present: this is the complete reading.
                     self._publish(measurement)
                     return
@@ -471,23 +648,46 @@ class Scale3Session:
                         # (e.g. shoes on): publish weight-only data.
                         self._publish(pending)
                         return
+                    if self._pending_standard is not None:
+                        self._publish(self._pending_standard)
+                        return
                     if final_requested_at is None:
                         await self._write(p.SVC_BODY_COMPOSITION, p.CHR_REALTIME_WEIGHT, b"")
                         final_requested_at = loop.time()
             else:
                 self._handle_info(kind, payload)
 
+        if self._pending_standard is not None and not self.measurement_published:
+            # No vendor measurement arrived, but the standard characteristic did:
+            # better a weight than nothing.
+            _LOGGER.debug("Falling back to the Bluetooth SIG measurement")
+            self._publish(self._pending_standard)
+            return
+
         received = ", ".join(f"{k} x{n}" for k, n in sorted(self._seen.items())) or "nothing"
         raise SessionError(
             "timed out waiting for a measurement "
-            f"(received {received}; last status {self._last_status}; "
+            f"({self._model.display_name}; received {received}; "
+            f"last status {self._last_status}; "
             f"weight seen: {pending is not None}; impedance seen: "
-            f"{pending is not None and pending.impedance_ohm is not None})"
+            f"{pending is not None and pending.impedance_ohm(self._impedance_units) is not None}; "
+            f"frames captured: {len(self._capture) if self._capture else 0})"
         )
 
-    def _publish(self, measurement: p.WeightMeasurement) -> None:
+    def _measurement_from(
+        self, kind: str, payload: bytes
+    ) -> p.WeightMeasurement | None:
+        """Parse a vendor or standard measurement payload."""
+        tolerant = self.tolerant_parsing
+        if kind == "unknown":
+            # An unfamiliar characteristic may still carry a vendor-shaped packet.
+            return p.parse_realtime_measurement(payload, tolerant=True)
+        return p.parse_any_measurement(kind, payload, tolerant=tolerant)
+
+    def _publish(self, measurement: p.WeightMeasurement, *, live: bool = True) -> None:
         self.measurement_published = True
-        self._on_measurement(measurement, True)
+        self.published_measurement = measurement
+        self._on_measurement(measurement, live)
 
     async def _drain_history(self) -> None:
         if not await self._write(p.SVC_BODY_COMPOSITION, p.CHR_HISTORY_WEIGHT, b""):
@@ -497,7 +697,7 @@ class Scale3Session:
                 payload = await self._expect_stream("history", HISTORY_RECORD_TIMEOUT)
             except TimeoutError:
                 return
-            record = p.parse_history_measurement(payload)
+            record = p.parse_history_measurement(payload, tolerant=self.tolerant_parsing)
             if record is None or record.weight_kg <= 0:
                 return  # end of history / unsupported packet
             self._on_measurement(record, False)
@@ -512,3 +712,7 @@ class Scale3Session:
                 del self._backlog[index]
                 return payload
         return await self._expect(kind, timeout)
+
+
+#: Backwards-compatible alias (the class used to be Scale 3 only).
+Scale3Session = ScaleSession

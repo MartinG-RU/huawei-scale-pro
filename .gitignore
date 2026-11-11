@@ -1,4 +1,6 @@
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
-.venv/
+*.txt.bak
+scale_dump_*.txt
+gatt_*.txt

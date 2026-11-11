@@ -1,11 +1,18 @@
-"""Protocol tests, anchored on the real Scale 3 capture from openScale's tests."""
+"""Protocol tests, anchored on the real Scale 3 capture from openScale's tests.
+
+The framing, CRC, key derivation and measurement decoding are bit-identical to
+the upstream Huawei Scale 3 port this project is based on, so the real capture
+still has to reproduce exactly. The Scale 3 Pro specific parts (model table,
+gender encoding, dual-frequency and standard-characteristic payloads) are tested
+on top of that.
+"""
 from __future__ import annotations
 
 from datetime import datetime
 
 import pytest
 
-from custom_components.huawei_scale3 import protocol as p
+from custom_components.huawei_scale_pro import protocol as p
 
 # ---- Real capture (HUAWEI Scale 3, 38:1E:C7:66:08:D3), from openScale's test suite
 CAK_UNUSED = bytes(16)
@@ -32,7 +39,6 @@ def _deframe(frames: list[str]) -> bytes:
 
 
 def test_crc_table_matches_openscale_constants():
-    # Spot values from the Kotlin lookup table.
     assert p._CRC16_TABLE[1] == 4129
     assert p._CRC16_TABLE[16] == 4657
     assert p._CRC16_TABLE[255] == 7920
@@ -78,7 +84,8 @@ def test_capture_decodes_to_expected_measurement():
     assert m.heart_rate == 97
     assert m.timestamp == datetime(2026, 8, 9, 23, 39, 29)
     assert m.low_impedance[0] == 0x13EA
-    assert m.impedance_ohm == pytest.approx(509.8)
+    assert m.impedance_ohm() == pytest.approx(509.8)
+    assert m.raw_payload == MEASUREMENT_PLAIN
 
 
 def test_corrupt_notification_crc_is_dropped():
@@ -153,7 +160,6 @@ def test_user_info_layout():
 
 
 def test_current_time_payload():
-    # Monday 2026-08-10 07:05:09
     assert p.current_time_payload(datetime(2026, 8, 10, 7, 5, 9)) == bytes(
         [0xEA, 0x07, 8, 10, 7, 5, 9, 1]
     )
@@ -176,6 +182,7 @@ def test_realtime_with_high_band():
     assert m.heart_rate == 72
     assert m.low_impedance == (500, 501, 502, 503, 504, 505)
     assert m.high_impedance == (600, 601, 602, 603, 604, 605)
+    assert m.has_high_frequency is True
 
 
 def test_realtime_tolerates_bad_timestamp_but_history_does_not():
@@ -190,9 +197,6 @@ def test_history_record_flags():
     more = p.parse_history_measurement(_realtime_payload() + b"\x01\x01")
     assert done.is_history_complete is True and more.is_history_complete is False
     assert done.timestamp == datetime(2026, 6, 22, 15, 14, 42)
-    assert done.dedupe_key == p.parse_history_measurement(
-        _realtime_payload() + b"\x01\x00"
-    ).dedupe_key
 
 
 def test_wrong_lengths_rejected():
@@ -211,7 +215,6 @@ def test_manager_info_basic_and_extended():
 
 
 def test_scale_version_bitfield():
-    # major=2 minor=0 patch=0 build=70 -> 0010 0000 0000 0001000110...
     bits = "0010" "0000" "0000" + format(70, "010b") + "00"
     raw = int(bits, 2).to_bytes(3, "big")
     v = p.parse_scale_version(b"\x00" + raw + b"SN12345")
@@ -230,13 +233,8 @@ def test_scale_version_bitfield():
         (None, False),
     ],
 )
-def test_identify_by_name(name, expected):
+def test_identify_scale_3(name, expected):
     assert p.identify_scale_3(name) is expected
-
-
-def test_identify_by_manufacturer_data():
-    assert p.identify_scale_3("x", {0x027D: b"model=M00D"})
-    assert not p.identify_scale_3("x", {0x027D: b"model=007B"})
 
 
 def test_weight_unit_payload_roundtrips_through_parse():
@@ -251,8 +249,125 @@ def test_parse_weight_unit_edge_cases():
 
 
 def test_max_payload_matches_the_decompiled_apps_chunk_ceiling():
-    # 238 bytes plain, or 222 ciphertext + 16-byte IV once encrypted.
     assert p.MAX_SIMPLE_PAYLOAD_BYTES == 238
     p.build_write_frames(bytes(238))
     with pytest.raises(ValueError):
         p.build_write_frames(bytes(239))
+
+
+# ---------------------------------------------------------------------------
+# Scale 3 Pro / family specific behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "family"),
+    [
+        ("HUAWEI Scale 3 Pro", p.Family.SCALE_3_PRO),
+        ("HUAWEI SCALE 3 PRO", p.Family.SCALE_3_PRO),
+        ("HAGRID-B29", p.Family.SCALE_3_PRO),
+        ("HAGRID2021-B19", p.Family.SCALE_3_PRO),
+        ("HUAWEI Scale 3", p.Family.SCALE_3),
+        ("HEM-B19", p.Family.SCALE_3),
+        ("HUAWEI Scale 2 Pro", p.Family.SCALE_2_PRO),
+        ("HAG-B19", p.Family.SCALE_2_PRO),
+        ("HONOR Scale 2", p.Family.HONOR_SCALE_2),
+    ],
+)
+def test_identify_hagrid_families(name, family):
+    profile = p.identify_hagrid(name)
+    assert profile is not None
+    assert profile.family == family
+
+
+def test_scale_3_pro_is_not_mistaken_for_scale_3():
+    """The Pro's name contains the Scale 3 marker; the longest match must win."""
+    profile = p.identify_hagrid("HUAWEI Scale 3 Pro")
+    assert profile.family == p.Family.SCALE_3_PRO
+    assert profile.display_name == "HUAWEI Scale 3 Pro"
+    assert profile.has_handle is True
+    assert profile.expected_high_frequency_impedance is True
+    assert profile.needs_tolerant_parsing is True
+
+
+def test_identify_by_manufacturer_data_and_product_id():
+    assert p.identify_hagrid("x", {0x027D: b"model=M00F"}).family == p.Family.SCALE_3_PRO
+    assert p.identify_hagrid("x", {0x027D: b"model=M00D"}).family == p.Family.SCALE_3
+    assert p.identify_hagrid("x", {0x027D: b"model=007B"}).family == p.Family.SCALE_2_PRO
+    assert p.identify_hagrid("Mi Body Composition Scale") is None
+    assert p.identify_hagrid(None) is None
+
+
+def test_gender_encoding_per_model():
+    """openScale: only the plain Scale 3 uses male=1; the Pro uses male=0."""
+    assert (p.profile_for_family(p.Family.SCALE_3).gender_male,
+            p.profile_for_family(p.Family.SCALE_3).gender_female) == (1, 0)
+    assert (p.profile_for_family(p.Family.SCALE_3_PRO).gender_male,
+            p.profile_for_family(p.Family.SCALE_3_PRO).gender_female) == (0, 1)
+    assert (p.profile_for_family(p.Family.SCALE_2_PRO).gender_male,
+            p.profile_for_family(p.Family.SCALE_2_PRO).gender_female) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("raw", "mode", "expected"),
+    [
+        (3500, "auto", 350.0),      # Scale 3: 0.1-ohm units
+        (3500, "tenths", 350.0),
+        (3500, "ohms", 3500.0),
+        (350, "auto", 350.0),       # a firmware reporting plain ohm
+        (0, "auto", None),
+        (60000, "auto", None),      # implausible
+    ],
+)
+def test_impedance_conversion(raw, mode, expected):
+    assert p.impedance_to_ohm(raw, mode) == expected
+
+
+def test_low_and_high_frequency_accessors():
+    m = p.parse_realtime_measurement(_realtime_payload())
+    assert m.low_ohm_all() == tuple(float(v) for v in range(500, 506))
+    assert m.high_ohm_all() == tuple(float(v) for v in range(600, 606))
+
+
+def test_tolerant_parsing_accepts_unknown_lengths():
+    payload = _realtime_payload() + bytes(range(6))  # 44 bytes, tail unknown
+    assert p.parse_realtime_measurement(payload) is None
+    tolerant = p.parse_realtime_measurement(payload, tolerant=True)
+    assert tolerant is not None
+    assert tolerant.weight_kg == pytest.approx(77.32)
+    assert tolerant.trailing_hex == bytes(range(6)).hex().upper()
+    assert tolerant.raw_payload == payload
+
+
+def test_standard_weight_measurement():
+    payload = bytes([0x00]) + round(86.25 / 0.005).to_bytes(2, "little")
+    m = p.parse_standard_weight_measurement(payload)
+    assert m is not None
+    assert m.weight_kg == pytest.approx(86.25, abs=0.01)
+    assert m.source == "standard_weight"
+    assert m.fat_percent == 0.0
+    assert p.parse_standard_weight_measurement(b"") is None
+
+
+def test_standard_body_composition_measurement():
+    # flags: fat present (always), timestamp, impedance, weight
+    flags = 0x0002 | 0x0200 | 0x0400
+    payload = bytearray(flags.to_bytes(2, "little"))
+    payload += round(30.1 * 10).to_bytes(2, "little")       # body fat 30.1 %
+    payload += bytes([0xEA, 0x07, 8, 9, 23, 39, 29])        # 2026-08-09 23:39:29
+    payload += round(362.5 * 10).to_bytes(2, "little")      # impedance
+    payload += round(86.25 / 0.005).to_bytes(2, "little")   # weight
+    m = p.parse_standard_body_composition_measurement(bytes(payload))
+    assert m is not None
+    assert m.fat_percent == pytest.approx(30.1)
+    assert m.weight_kg == pytest.approx(86.25, abs=0.01)
+    assert m.impedance_ohm() == pytest.approx(362.5)
+    assert m.timestamp == datetime(2026, 8, 9, 23, 39, 29)
+
+
+def test_capability_bits():
+    # bit 18 set -> byte 2, bit 2 (0x04); also bit 0 -> byte 0, 0x01
+    assert p.parse_capability_bits("010004") == {0, 18}
+    assert p.CAPABILITY_BIT_HIGH_FREQUENCY_IMPEDANCE in p.parse_capability_bits("010004")
+    assert p.parse_capability_bits("zzz") == set()
+    assert p.find_capability_bits("x", {0x027D: b"capacity:040100"}) == {2, 8}

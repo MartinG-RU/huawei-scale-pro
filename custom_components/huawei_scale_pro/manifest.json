@@ -1,0 +1,96 @@
+{
+  "domain": "huawei_scale_pro",
+  "name": "Huawei Scale 3 Pro",
+  "bluetooth": [
+    {
+      "local_name": "HUAWEI Scale 3 Pro*",
+      "connectable": true
+    },
+    {
+      "local_name": "HUAWEI SCALE 3 PRO*",
+      "connectable": true
+    },
+    {
+      "local_name": "HUAWEI Scale 3*",
+      "connectable": true
+    },
+    {
+      "local_name": "HUAWEI SCALE 3*",
+      "connectable": true
+    },
+    {
+      "local_name": "HUAWEI Scale 2 Pro*",
+      "connectable": true
+    },
+    {
+      "local_name": "HAGRID-B29*",
+      "connectable": true
+    },
+    {
+      "local_name": "HAGRID2021-B19*",
+      "connectable": true
+    },
+    {
+      "local_name": "HAGRID-B19*",
+      "connectable": true
+    },
+    {
+      "local_name": "HAG-B19*",
+      "connectable": true
+    },
+    {
+      "local_name": "HEM-B19*",
+      "connectable": true
+    },
+    {
+      "local_name": "HERM-B19*",
+      "connectable": true
+    },
+    {
+      "local_name": "HONOR Scale 2*",
+      "connectable": true
+    },
+    {
+      "local_name": "LUP-B19*",
+      "connectable": true
+    },
+    {
+      "local_name": "LUPIN-B19HN*",
+      "connectable": true
+    },
+    {
+      "local_name": "N001*",
+      "connectable": true
+    },
+    {
+      "local_name": "DOBBY-B19*",
+      "connectable": true
+    },
+    {
+      "local_name": "M00D*",
+      "connectable": true
+    },
+    {
+      "local_name": "M00F*",
+      "connectable": true
+    },
+    {
+      "local_name": "M0CJ*",
+      "connectable": true
+    },
+    {
+      "service_uuid": "0000181b-0000-1000-8000-00805f9b34fb"
+    }
+  ],
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [
+    "bluetooth_adapters"
+  ],
+  "documentation": "https://github.com/MartinG-RU/huawei-scale-pro",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "requirements": [],
+  "version": "1.5.0",
+  "issue_tracker": "https://github.com/MartinG-RU/huawei-scale-pro/issues"
+}

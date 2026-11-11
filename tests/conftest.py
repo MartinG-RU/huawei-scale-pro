@@ -1,9 +1,28 @@
-"""Shared fixtures."""
+"""Shared fixtures.
+
+The Home Assistant facing modules (``__init__``, coordinator, config flow, …)
+are not imported here: these tests exercise the pure-Python protocol, session
+and model code, so they run without a Home Assistant install. Importing the
+package would execute its ``__init__`` (which needs Home Assistant), so a bare
+namespace module is registered for the package first.
+"""
 from __future__ import annotations
 
-import pytest
+import sys
+import types
+from pathlib import Path
 
-from custom_components.huawei_scale3 import session
+_PACKAGE = "custom_components.huawei_scale_pro"
+_PACKAGE_PATH = Path(__file__).resolve().parent.parent / "custom_components" / "huawei_scale_pro"
+
+if _PACKAGE not in sys.modules:
+    package = types.ModuleType(_PACKAGE)
+    package.__path__ = [str(_PACKAGE_PATH)]  # type: ignore[attr-defined]
+    sys.modules[_PACKAGE] = package
+
+import pytest  # noqa: E402
+
+from custom_components.huawei_scale_pro import session  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -17,9 +36,3 @@ def fast_session_timers(monkeypatch):
     monkeypatch.setattr(session, "FINAL_REQUEST_GRACE", 0.1)
     monkeypatch.setattr(session, "MEASUREMENT_TIMEOUT", 1.0)
     monkeypatch.setattr(session, "MAX_STATUS_POLLS", 5)
-
-
-@pytest.fixture
-def auto_enable_custom_integrations(enable_custom_integrations):
-    """Load ``custom_components`` in Home Assistant tests."""
-    yield
